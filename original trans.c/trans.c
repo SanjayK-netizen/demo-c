@@ -3,6 +3,25 @@
 // be placed in the file, and deletes data previously in the file.
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <ctype.h>
+
+#define LOG_FILE "audit.log"
+#define MAX_ATTEMPTS 3
+
+// hash function for PIN
+unsigned int hashPin(const char *pin);
+
+// log action to audit file
+void logAction(const char *action);
+
+// initialize default PIN
+void initPassword(void);
+
+// authenticate user with PIN
+int authenticateUser(void);
+
 // clientData structure definition
 struct clientData
 {
@@ -24,12 +43,33 @@ int main(int argc, char *argv[])
     FILE *cfPtr;         // credit.dat file pointer
     unsigned int choice; // user's choice
 
-    // fopen opens the file; exits if file cannot be opened
+    // fopen opens the file; create if doesn't exist
     if ((cfPtr = fopen("credit.dat", "rb+")) == NULL)
     {
-        printf("%s: File could not be opened.\n", argv[0]);
+        if ((cfPtr = fopen("credit.dat", "wb")) != NULL)
+        {
+            fclose(cfPtr);
+            cfPtr = fopen("credit.dat", "rb+");
+        }
+        else
+        {
+            printf("%s: File could not be opened.\n", argv[0]);
+            exit(-1);
+        }
+    }
+
+    // initialize default PIN if needed
+    initPassword();
+
+    // authenticate user
+    if (!authenticateUser())
+    {
+        printf("Access denied. Too many failed attempts.\n");
+        fclose(cfPtr);
         exit(-1);
     }
+
+    logAction("User logged in");
 
     // enable user to specify action
     while ((choice = enterChoice()) != 5)
@@ -59,8 +99,93 @@ int main(int argc, char *argv[])
         } // end switch
     }     // end while
 
+    logAction("User logged out");
     fclose(cfPtr); // fclose closes the file
 } // end main
+
+// hash function for PIN
+unsigned int hashPin(const char *pin)
+{
+    unsigned int hash = 5381;
+    while (*pin)
+    {
+        hash = ((hash << 5) + hash) + *pin++;
+    }
+    return hash;
+}
+
+// log action to audit file
+void logAction(const char *action)
+{
+    FILE *log = fopen(LOG_FILE, "a");
+    if (!log) return;
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char timestamp[26];
+    strftime(timestamp, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+
+    fprintf(log, "[%s] %s\n", timestamp, action);
+    fclose(log);
+}
+
+// initialize default PIN
+void initPassword(void)
+{
+    FILE *fPtr = fopen("credit.dat", "rb+");
+    if (!fPtr) return;
+
+    fseek(fPtr, 0, SEEK_SET);
+    unsigned int storedHash;
+    if (fread(&storedHash, sizeof(unsigned int), 1, fPtr) != 1)
+    {
+        fseek(fPtr, 0, SEEK_SET);
+        unsigned int defaultPin = hashPin("1234");
+        fwrite(&defaultPin, sizeof(unsigned int), 1, fPtr);
+        printf("Default PIN set to: 1234\n");
+        logAction("Default PIN initialized");
+    }
+    fclose(fPtr);
+}
+
+// authenticate user with PIN
+int authenticateUser(void)
+{
+    FILE *fPtr = fopen("credit.dat", "rb+");
+    if (!fPtr) return 0;
+
+    fseek(fPtr, 0, SEEK_SET);
+    unsigned int storedHash;
+    fread(&storedHash, sizeof(unsigned int), 1, fPtr);
+    fclose(fPtr);
+
+    char pin[5];
+    int attempts = 0;
+
+    while (attempts < MAX_ATTEMPTS)
+    {
+        printf("Enter 4-digit PIN: ");
+        scanf("%4s", pin);
+
+        if (strlen(pin) != 4 || !isdigit(pin[0]) || !isdigit(pin[1]) ||
+            !isdigit(pin[2]) || !isdigit(pin[3]))
+        {
+            printf("Invalid PIN format. Must be 4 digits.\n");
+            continue;
+        }
+
+        if (hashPin(pin) == storedHash)
+        {
+            return 1;
+        }
+
+        attempts++;
+        printf("Incorrect PIN. Attempts remaining: %d\n", MAX_ATTEMPTS - attempts);
+    }
+
+    logAction("Failed login attempts exceeded");
+    return 0;
+}
 
 // create formatted text file for printing
 void textFile(FILE *readPtr)
@@ -94,7 +219,9 @@ void textFile(FILE *readPtr)
         }     // end while
 
         fclose(writePtr); // fclose closes the file
-    }                     // end else
+        printf("Account list exported to accounts.txt\n");
+        logAction("Exported account list");
+    } // end else
 } // end function textFile
 
 // update balance in record
@@ -125,6 +252,15 @@ void updateRecord(FILE *fPtr)
         // request transaction amount from user
         printf("%s", "Enter charge ( + ) or payment ( - ): ");
         scanf("%lf", &transaction);
+
+        // check for insufficient funds
+        if (transaction < 0 && client.balance + transaction < 0)
+        {
+            printf("Insufficient funds. Transaction denied.\n");
+            logAction("Insufficient funds");
+            return;
+        }
+
         client.balance += transaction; // update record balance
 
         printf("%-6d%-16s%-11s%10.2f\n", client.acctNum, client.lastName, client.firstName, client.balance);
@@ -134,6 +270,11 @@ void updateRecord(FILE *fPtr)
         fseek(fPtr, -sizeof(struct clientData), SEEK_CUR);
         // write updated record over old record in file
         fwrite(&client, sizeof(struct clientData), 1, fPtr);
+
+        // log the transaction
+        char logMsg[100];
+        snprintf(logMsg, sizeof(logMsg), "Account %d updated: %.2f", account, transaction);
+        logAction(logMsg);
     } // end else
 } // end function updateRecord
 
@@ -143,6 +284,7 @@ void deleteRecord(FILE *fPtr)
     struct clientData client;                       // stores record read from file
     struct clientData blankClient = {0, "", "", 0}; // blank client
     unsigned int accountNum;                        // account number
+    char confirm;
 
     // obtain number of account to delete
     printf("%s", "Enter account number to delete ( 1 - 100 ): ");
@@ -158,11 +300,28 @@ void deleteRecord(FILE *fPtr)
         printf("Account %d does not exist.\n", accountNum);
     } // end if
     else
-    { // delete record
-        // move file pointer to correct record in file
-        fseek(fPtr, (accountNum - 1) * sizeof(struct clientData), SEEK_SET);
-        // replace existing record with blank record
-        fwrite(&blankClient, sizeof(struct clientData), 1, fPtr);
+    {
+        // confirm deletion
+        printf("Confirm deletion of account #%d (y/n): ", accountNum);
+        scanf(" %c", &confirm);
+
+        if (confirm == 'y' || confirm == 'Y')
+        {
+            // move file pointer to correct record in file
+            fseek(fPtr, (accountNum - 1) * sizeof(struct clientData), SEEK_SET);
+            // replace existing record with blank record
+            fwrite(&blankClient, sizeof(struct clientData), 1, fPtr);
+            printf("Account deleted successfully.\n");
+
+            // log the deletion
+            char logMsg[50];
+            snprintf(logMsg, sizeof(logMsg), "Account %d deleted", accountNum);
+            logAction(logMsg);
+        }
+        else
+        {
+            printf("Deletion cancelled.\n");
+        }
     } // end else
 } // end function deleteRecord
 
@@ -192,11 +351,23 @@ void newRecord(FILE *fPtr)
         printf("%s", "Enter lastname, firstname, balance\n? ");
         scanf("%14s%9s%lf", client.lastName, client.firstName, &client.balance);
 
+        // prevent negative balance
+        if (client.balance < 0)
+        {
+            printf("Initial balance cannot be negative. Set to 0.\n");
+            client.balance = 0;
+        }
+
         client.acctNum = accountNum;
         // move file pointer to correct record in file
         fseek(fPtr, (client.acctNum - 1) * sizeof(struct clientData), SEEK_SET);
         // insert record in file
         fwrite(&client, sizeof(struct clientData), 1, fPtr);
+
+        // log the new account
+        char logMsg[100];
+        snprintf(logMsg, sizeof(logMsg), "New account created: %d", accountNum);
+        logAction(logMsg);
     } // end else
 } // end function newRecord
 
