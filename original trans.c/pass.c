@@ -6,7 +6,6 @@
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
-#include <unistd.h>
 
 #define LOG_FILE "audit.log"
 #define MAX_ATTEMPTS 3
